@@ -1,0 +1,249 @@
+
+name: Job Scraper
+
+on:
+  schedule:
+    # Twice daily: 8:30 AM UTC and 8:30 PM UTC (2:00 PM IST / 2:00 AM IST)
+    - cron: '30 8 * * *'
+    - cron: '30 20 * * *'
+  workflow_dispatch:  # Manual trigger from Actions tab
+
+
+permissions: {}
+
+# Prevent overlapping runs. If the previous cron is still scraping when the
+# next one fires, cancel the older run to avoid double-scraping.
+concurrency:
+  group: scraper
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 1: Clone private repo → Seed DB → Build per-company matrix
+  # ─────────────────────────────────────────────────────────────────────────
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.build_matrix.outputs.matrix }}
+    steps:
+      # ── 1. Clone the private repo using the fine-grained PAT ─────────────
+      - name: Clone private repository
+        run: |
+          git clone --depth 1 \
+            https://x-access-token:${{ secrets.PRIVATE_REPO_PAT }}@github.com/Anshikaaggarwal/hiring-24x7.git \
+            .
+
+      # ── 2. Fail fast if any required secret is missing ───────────────────
+      - name: Verify required secrets
+        env:
+          JOBS_DATABASE_URL: ${{ secrets.JOBS_DATABASE_URL }}
+          PRIVATE_REPO_PAT: ${{ secrets.PRIVATE_REPO_PAT }}
+        run: |
+          MISSING=""
+          if [ -z "$JOBS_DATABASE_URL" ]; then MISSING="$MISSING JOBS_DATABASE_URL"; fi
+          if [ -z "$PRIVATE_REPO_PAT" ]; then MISSING="$MISSING PRIVATE_REPO_PAT"; fi
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing required secrets:$MISSING"
+            echo "Add them under: Repo → Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          echo "✅ All required secrets are set"
+
+      # ── 3. Set up Python (same version as private repo's monitor.yml) ────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      # ── 4. Install Python dependencies ───────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt
+
+      # ── 5. Seed companies into the database ──────────────────────────────
+      - name: Seed companies into DB
+        env:
+          DATABASE_URL: ${{ secrets.JOBS_DATABASE_URL }}
+          JOBS_DATABASE_URL: ${{ secrets.JOBS_DATABASE_URL }}
+          PYTHONPATH: backend
+        run: |
+          echo "🌱 Seeding company list..."
+          python - <<'PYEOF'
+          import asyncio, os, uuid
+          from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+          from sqlalchemy.pool import NullPool
+          from sqlalchemy import select
+
+          DB = os.environ['DATABASE_URL'].replace('postgresql://', 'postgresql+asyncpg://').replace('postgres://', 'postgresql+asyncpg://')
+
+          def _ps(): return f'__asyncpg_{uuid.uuid4().hex}__'
+          engine = create_async_engine(DB, poolclass=NullPool, pool_pre_ping=True, connect_args={'statement_cache_size':0,'prepared_statement_cache_size':0,'prepared_statement_name_func':_ps})
+          SM = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+          async def seed():
+              from app.seed.companies import TARGET_COMPANIES
+              from app.models.entities import Company
+              from app.models.enums import ATSProvider
+
+              created = 0
+              async with SM() as s:
+                  for c in TARGET_COMPANIES:
+                      existing = await s.scalar(select(Company).where((Company.slug == c['slug']) | (Company.name == c['name'])))
+                      if not existing:
+                          try:
+                              prov = ATSProvider[c['ats_provider']]
+                          except KeyError:
+                              prov = ATSProvider.UNKNOWN
+                          try:
+                              s.add(Company(
+                                  name=c['name'], slug=c['slug'],
+                                  homepage_url=c.get('homepage_url',''),
+                                  career_url=c.get('career_url',''),
+                                  ats_provider=prov,
+                                  ats_identifier=c.get('ats_identifier', c['slug']),
+                                  is_active=True,
+                              ))
+                              await s.flush()
+                              created += 1
+                          except Exception as e:
+                              await s.rollback()
+                              print(f"Skipping {c['name']} due to error: {e}")
+                  await s.commit()
+              print(f'Seed done: {created} new companies registered')
+              await engine.dispose()
+
+          asyncio.run(seed())
+          PYEOF
+
+      # ── 6. Build the per-company scraper matrix ──────────────────────────
+      - name: Build scraper matrix
+        id: build_matrix
+        env:
+          DATABASE_URL: ${{ secrets.JOBS_DATABASE_URL }}
+          JOBS_DATABASE_URL: ${{ secrets.JOBS_DATABASE_URL }}
+          PYTHONPATH: backend
+        run: |
+          echo "📋 Building scraper matrix..."
+          MATRIX=$(python - <<'PYEOF'
+          import asyncio, os, uuid, json
+          from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+          from sqlalchemy.pool import NullPool
+          from sqlalchemy import select
+
+          DB = os.environ['DATABASE_URL'].replace('postgresql://', 'postgresql+asyncpg://').replace('postgres://', 'postgresql+asyncpg://')
+          def _ps(): return f'__asyncpg_{uuid.uuid4().hex}__'
+          engine = create_async_engine(DB, poolclass=NullPool, pool_pre_ping=True, connect_args={'statement_cache_size':0,'prepared_statement_cache_size':0,'prepared_statement_name_func':_ps})
+          SM = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+          async def build():
+              from app.models.entities import Company
+              async with SM() as s:
+                  rows = (await s.execute(
+                      select(Company.ats_provider, Company.slug)
+                      .where(Company.is_active.is_(True))
+                  )).all()
+              await engine.dispose()
+
+              # One matrix entry per company so every company runs in its own
+              # dedicated parallel job. Target string is "<PROVIDER>:<slug>"
+              # so the runner can gate Playwright install on CAREER_PAGE and
+              # pass --slug to run_scraper.py.
+              matrix = []
+              for prov, slug in sorted(rows, key=lambda r: ((r[0].name if r[0] else ''), r[1])):
+                  if not prov:
+                      continue
+                  matrix.append({'target': f'{prov.name}:{slug}'})
+              return matrix
+
+          matrix = asyncio.run(build())
+          print(json.dumps({'include': matrix}))
+          PYEOF
+          )
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "Scraper targets:"
+          echo "$MATRIX" | python3 -c "import json,sys; m=json.load(sys.stdin); [print(f'  - {row[\"target\"]}') for row in m['include']]"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 2: Scrape every company in its own parallel job
+  #   - One matrix entry per company so a slow site never starves another.
+  #     Each company gets its own 180-min budget.
+  #   - max-parallel caps concurrency to stay under GitHub's job limits;
+  #     jobs beyond that queue and start as slots free up.
+  # ─────────────────────────────────────────────────────────────────────────
+  scrape:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: 20
+    steps:
+      # ── 1. Clone the private repo (each matrix job needs its own copy) ───
+      - name: Clone private repository
+        run: |
+          git clone --depth 1 \
+            https://x-access-token:${{ secrets.PRIVATE_REPO_PAT }}@github.com/Anshikaaggarwal/hiring-24x7.git \
+            .
+
+      # ── 2. Set up Python ─────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      # ── 3. Install dependencies + Playwright for CAREER_PAGE targets ─────
+      - name: Install dependencies
+        run: |
+          pip install -r backend/requirements.txt
+          # Install Playwright browsers only for CAREER_PAGE jobs
+          if [[ "${{ matrix.target }}" == CAREER_PAGE:* ]]; then
+            echo "🎭 Installing Playwright Chromium for CAREER_PAGE scraping..."
+            python -m playwright install chromium --with-deps
+          fi
+
+      # ── 4. Cache HuggingFace models across runs ─────────────────────────
+      - name: Cache HuggingFace models
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-hf-all-MiniLM-L6-v2
+
+      # ── 5. Run the scraper for this company ──────────────────────────────
+      - name: Scrape ${{ matrix.target }}
+        env:
+          DATABASE_URL: ${{ secrets.JOBS_DATABASE_URL }}
+          JOBS_DATABASE_URL: ${{ secrets.JOBS_DATABASE_URL }}
+          PYTHONPATH: backend
+          PYTHONUNBUFFERED: "1"
+        run: |
+          TARGET="${{ matrix.target }}"
+          # Target format: "<PROVIDER>:<slug>" — split on first ':' only.
+          SLUG="${TARGET#*:}"
+          echo "=========================================="
+          echo "🚀 Scraping target: $TARGET (slug=$SLUG)"
+          echo "=========================================="
+          python scripts/run_scraper.py --slug "$SLUG"
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "::warning::$TARGET scraper finished with failures (exit=$EXIT_CODE)"
+          fi
+          exit $EXIT_CODE
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Phase 3: Wake up Render so the API is warm for users after scraping
+  # ─────────────────────────────────────────────────────────────────────────
+  wake_render:
+    needs: scrape
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Wake up Render API
+        run: |
+          echo "☀️ Warming up Render backend API..."
+          curl -sf https://gethired-backend-sqnz.onrender.com/docs > /dev/null || true
+          echo "✅ Render warmed up"
