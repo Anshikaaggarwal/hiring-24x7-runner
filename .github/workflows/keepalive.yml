@@ -2,9 +2,9 @@ name: Keep Render Awake
 
 on:
   schedule:
-    # Run every 5 minutes to prevent Render free tier from sleeping (sleeps after 15m)
-    # GitHub often delays cron jobs, so 5 mins ensures it hits before the 15m window closes.
-    - cron: '*/5 * * * *'
+    # Run every 3 minutes to prevent Render free tier from sleeping (sleeps after 15m)
+    # GitHub often delays cron jobs, so 3 mins ensures it hits before the 15m window closes.
+    - cron: '*/3 * * * *'
   workflow_dispatch: # Allow manual trigger
 
 jobs:
