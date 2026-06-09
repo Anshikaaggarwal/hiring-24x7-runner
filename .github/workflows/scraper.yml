@@ -195,15 +195,12 @@ jobs:
           cache: 'pip'
           cache-dependency-path: backend/requirements.txt
 
-      # ── 3. Install dependencies + Playwright for CAREER_PAGE targets ─────
+      # ── 3. Install dependencies + Playwright ─────
       - name: Install dependencies
         run: |
           pip install -r backend/requirements.txt
-          # Install Playwright browsers only for CAREER_PAGE jobs
-          if [[ "${{ matrix.target }}" == CAREER_PAGE:* ]]; then
-            echo "🎭 Installing Playwright Chromium for CAREER_PAGE scraping..."
-            python -m playwright install chromium --with-deps
-          fi
+          echo "🎭 Installing Playwright Chromium..."
+          python -m playwright install chromium --with-deps
 
       # ── 4. Cache HuggingFace models across runs ─────────────────────────
       - name: Cache HuggingFace models
