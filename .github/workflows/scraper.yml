@@ -3,8 +3,8 @@ name: Job Scraper
 
 on:
   schedule:
-    # Once daily around 1 AM UTC
-    - cron: '0 1 * * *'
+    # Once daily at 12:00 AM IST (18:30 UTC)
+    - cron: '30 18 * * *'
   workflow_dispatch:  # Manual trigger from Actions tab
 
 
